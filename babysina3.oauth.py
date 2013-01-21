@@ -3,11 +3,10 @@
 
 from weibo import APIClient
 import weibo
-import mypassx as mypass
+import mypass_chainsaw as mypass
 import sys
-#import pg
+import pg
 import httplib
-#import simplejson
 import time
 import string
 
@@ -18,11 +17,8 @@ import datetime
 import csv
 import types
 
-#import weibopy2 # we use our own slightly-extended version of weibopy
 import unittest
 import socket
-#from weibopy.auth import OAuthHandler, BasicAuthHandler
-#from weibopy.api import API
 
 #import lucene
 #import sinaweibolucene
@@ -40,7 +36,7 @@ class API():
     max_gotall_count = 3
     api_wait_secs = 5
     max_api_misses_half = 3
-    max_api_misses = 6
+    max_api_misses = 3
     max_reposts_pages = max_comments_pages = 1000
     max_reposts_blanks = max_comments_blanks = 3
     max_reposts_tries = max_comments_tries = 3
@@ -63,9 +59,16 @@ class API():
 
 
     #def __init__(self, auth):
-    def setToken(self):
+    def setClient(self):
         self.api2 = APIClient(app_key=self.sinaweiboOauth['app_key'], app_secret=self.sinaweiboOauth['app_secret'], redirect_uri=self.sinaweiboOauth['redirect_uri'])
+
+    def setToken(self, access_token, expires_in):
+        self.api2.set_access_token(access_token, expires_in)
+    
+    def reqToken(self, access):
         self.api2.set_access_token(self.sinaweiboOauth['access_token'], self.sinaweiboOauth['expires_in'])
+
+
     def getAtt(self, obj, key):
         try:
             return obj.__getattribute__(key)
@@ -85,10 +88,14 @@ class API():
         datedt = datetime.datetime.strptime(textdate, "%a %b %d %H:%M:%S %Y")
         return datedt.strftime("%Y-%m-%d %H:%M:%S")
     #def get_rateLimit(self):
+
+    def get_apistatus(self):
+        ratelimit = self.api2.account.rate_limit_status.get()
+        print ratelimit
         
     def get_status(self, id, getUser=False, toDB=False):
-        time_db = 0
-        time_db_u = 0
+        #time_db = 0
+        #time_db_u = 0
         start_time_api = time.time()
         api_misses = 0
         while api_misses < self.max_api_misses:
@@ -98,14 +105,18 @@ class API():
             except weibo.APIError as e: ## Need more exception handling.
                 print e.message
                 api_misses += 1
-                if api_misses >= self.max_api_misses or ("target weibo does not exist" in e.message.lower() or "permission denied" in e.message.lower()):
-                    return { "id": id, "msg": e.message } ## aka toxicbar
+                if api_misses >= self.max_api_misses:
+                    return { "id": id, "err_msg": e.message } ## aka toxicbar
+                if e.message is not None and  ("target weibo does not exist" in e.message.lower() or "permission denied" in e.message.lower()):
+                    permission_denied = False
+                    if ("permission denied" in e.message.lower()):
+                        permission_denied = True
+                    return { 'id': id, "error_msg": e.message, "deleted": True, "Permission_denied": permission_denied }
                 time.sleep(self.api_wait_secs * 1)
         time_api = time.time() - start_time_api
         # status is just a glorified dict, not an object like weibopy2
         # So don't need to use getAtt
         row = self.status_to_row(status) 
-        # TODO: push row to db
         return row
 
     def status_to_row(self, status):
@@ -166,18 +177,108 @@ class API():
 	    x["geo"] = "SRID=4326;" + wkt_point
 	return x
 
+    def get_usertimeline(self, user_id, count=100, page=1):
+        start_time_api = time.time()
+        api_misses = 0
+        while api_misses < self.max_api_misses:
+            try:
+                timeline = self.api2.statuses.user_timeline.get(uid=user_id, count=count, page=page)
+                break
+            except Exception as e:
+                print e.message
+                api_misses += 1
+                if api_misses >= self.max_api_misses:
+                    return { "id": user_id, "err_msg": e.message }
+        return timeline
+
+    def get_userinfo(self, user_id):
+        start_time_api = time.time()
+        api_misses = 0
+        while api_misses < self.max_api_misses:
+            try:
+                userinfo = self.api2.users.show.get(uid=user_id)
+                break
+            except Exception as e:
+                print e.message
+                api_misses += 1
+                if api_misses >= self.max_api_misses:
+                    return { "id": id, "err_msg": e.message }
+        return userinfo
+
+
+    def user_to_row(self, userinfo):
+	x = dict()
+	try:
+            x["created_at"] = self.fixdate(userinfo["created_at"])
+	    #x["created_at"] = self.getAtt(user, "created_at").strftime("%Y-%m-%d %H:%M:%S")
+	except:
+	    #print self.getAtt(user, "id")
+	    #print self.getAtt(user, "created_at")
+	    x["created_at"] = None
+	x["retrieved"] = "NOW()"
+	for a in ["name", "screen_name", "location", "description", "profile_image_url", "url", "avatar_large", "verified_reason"]:
+	    try:
+		att = userinfo[a]
+		x[a] = att.encode("utf8")
+	    except:
+		x[a] = None
+	for a in ["id", "province", "city", "domain", "gender", "followers_count", "friends_count", "favourites_count", \
+"time_zone", "profile_background_image_url", "profile_use_background_image", "allow_all_act_msg", "geo_enabled", \
+"verified", "following", "statuses_count", "allow_all_comment", "bi_followers_count", "deleted", "verified_type", "lang", "online_status"]:
+            try:
+                x[a] = userinfo[a]
+            except:
+                x[a] = None
+	return x
+
+
+
+
     def dispatch(self, opt, id, output_counts=False):
-        if opt == 9:
+        ### doomsday mode: a combined user and usertimeline
+        ### will only get user detail when statuses = []
+        ### 
+        if opt == 1:
+            timeline = self.get_usertimeline(id)
+            #print timeline['total_number']
+            ## if no error
+            if long(timeline['total_number']) > 0 and len(timeline['statuses']) > 0:
+                msg_id = list()
+                user_punched = False
+                for status in timeline['statuses']:
+                    row = self.status_to_row(status)  ## TODO: push row to DB
+                    if not user_punched:
+                        userinfo = status['user'] ## user_to_row it and punch to DB if needed
+                        print self.user_to_row(userinfo)
+                        user_punched = True
+                    #if 'retweeted_status_user_id' in row.keys():
+                        ###
+                    #     rt_userinfo = status['retweeted_status']['user'] ## optionally also punch it also to DB
+                    #     print self.status_to_row(rt_userinfo)
+                    msg_id.append(row['id'])
+                out = { 'msg_id': msg_id } ### return a list of all weibo id from timeline
+            elif long(timeline['total_number']) > 0 and len(timeline['statuses']) == 0:
+                ### blank timeline can be error, need to double check.
+                out = None
+            else:
+                ### TODO: Confirmed Empty timeline, check the user info
+                out = self.user_to_row(self.get_userinfo(id))
+        elif opt == 9:
             out = self.get_status(id, getUser = True)
+            ### will it be better if we put the row into the DB here?
+            ### if err_msg in out, and if deleted = True, update the DB for the deleted and permission_denied field
+            ### else it is a valid row, put into DB as new record
         else:
             out = None
-            #        print out
         return out
+
 
 
 if __name__ == "__main__":
     api = API()
-    api.setToken()
+    api.setClient()
+    api.setToken(api.sinaweiboOauth['access_token'], api.sinaweiboOauth['expires_in'])
+
     if len(sys.argv) <= 2:
         print "good bye\n"
         sys.exit()
@@ -189,15 +290,15 @@ if __name__ == "__main__":
             fname = str(sys.argv[1])
     if len(sys.argv) > 2:
         opt = sys.argv[2]
-        if opt == "-ss" or opt == "--single-status":
+        if opt == "-doom" or opt == "--doomsday-mode": # in the future, we will only have one doomsday mode to replace usertimeline and user. To save API spending.
+            opt = 1
+        elif opt == "-ss" or opt == "--single-status":
             opt = 9
-        elif opt == "-as": # display API status, rate limit and token expiry
-            opt = 2046
         else:
             print "good bye\n"
             sys.exit()
     if id > 0:
         out = api.dispatch(opt, id)
-    output = { "data": out, "opt": opt, "count": len(out), "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") }
+    output = { "data": out, "opt": opt, "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") }
     print output
             #    print api.get_status(id=3481475946781445)
